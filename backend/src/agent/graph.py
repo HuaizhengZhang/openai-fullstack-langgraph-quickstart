@@ -7,7 +7,8 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
+from openai import OpenAI
+from tavily import TavilyClient
 
 from agent.state import (
     OverallState,
@@ -23,7 +24,7 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from agent.utils import (
     get_citations,
     get_research_topic,
@@ -33,18 +34,24 @@ from agent.utils import (
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
+if os.getenv("OPENAI_API_KEY") is None:
+    raise ValueError("OPENAI_API_KEY is not set")
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+if os.getenv("TAVILY_API_KEY") is None:
+    raise ValueError("TAVILY_API_KEY is not set")
+
+# Used for OpenAI API
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Used for Tavily Search API
+tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
     """LangGraph node that generates search queries based on the User's question.
 
-    Uses Gemini 2.0 Flash to create an optimized search queries for web research based on
+    Uses OpenAI models to create an optimized search queries for web research based on
     the User's question.
 
     Args:
@@ -60,12 +67,12 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
+    # init OpenAI model
+    llm = ChatOpenAI(
         model=configurable.query_generator_model,
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("OPENAI_API_KEY"),
     )
     structured_llm = llm.with_structured_output(SearchQueryList)
 
@@ -78,6 +85,7 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     )
     # Generate the search queries
     result = structured_llm.invoke(formatted_prompt)
+    
     return {"search_query": result.query}
 
 
@@ -93,9 +101,10 @@ def continue_to_web_research(state: QueryGenerationState):
 
 
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
+    """LangGraph node that performs web research using Tavily Search API.
 
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
+    Executes a web search using Tavily Search API and synthesizes the results using OpenAI models.
+    This function aligns with the original Google Search implementation structure.
 
     Args:
         state: Current graph state containing the search query and research loop count
@@ -111,23 +120,67 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         research_topic=state["search_query"],
     )
 
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
-    )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+    # Perform Tavily search
+    search_query = state["search_query"]
+    try:
+        search_response = tavily_client.search(
+            query=search_query,
+            search_depth="advanced",
+            include_answer=True,
+            include_raw_content=True,
+            max_results=10
+        )
+    except Exception as e:
+        print(f"Tavily search error: {e}")
+        return {
+            "sources_gathered": [],
+            "search_query": [state["search_query"]],
+            "web_research_result": [f"Error performing search for: {search_query}"],
+        }
+    
+    # Extract search results and create sources
+    search_results = search_response.get("results", [])
+    sources_gathered = []
+    
+    # Create URL mappings similar to original
+    resolved_urls_map = resolve_urls(search_results, state["id"])
+    
+    # Process each search result to create sources
+    for idx, result in enumerate(search_results):
+        url = result.get("url", "")
+        short_url = resolved_urls_map.get(url, f"https://search-result.com/id/{state['id']}-{idx}")
+        
+        source_info = {
+            "label": result.get("title", f"Source {idx + 1}"),
+            "short_url": short_url,
+            "value": url
+        }
+        sources_gathered.append(source_info)
+    
+    # Create search content for the prompt
+    search_content = "\n\n".join([
+        f"Source {i+1}: {result.get('title', '')}\nURL: {result.get('url', '')}\nContent: {result.get('content', '')}"
+        for i, result in enumerate(search_results)
+    ])
+    
+    enhanced_prompt = f"{formatted_prompt}\n\nSearch Results:\n{search_content}"
+    
+    try:
+        response = openai_client.chat.completions.create(
+            model=configurable.query_generator_model,
+            messages=[{"role": "user", "content": enhanced_prompt}],
+            temperature=0,
+        )
+        
+        modified_text = response.choices[0].message.content
+    except Exception as e:
+        print(f"OpenAI API error: {e}")
+        modified_text = f"Unable to process search results for query: {search_query}"
+    
+    # Get citations and insert them
+    citations = get_citations(search_response, resolved_urls_map)
+    if citations:
+        modified_text = insert_citation_markers(modified_text, citations)
 
     return {
         "sources_gathered": sources_gathered,
@@ -163,11 +216,11 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
     # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
+    llm = ChatOpenAI(
         model=reasoning_model,
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("OPENAI_API_KEY"),
     )
     result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
@@ -241,12 +294,12 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
+    # init Reasoning Model, default to GPT-4o
+    llm = ChatOpenAI(
         model=reasoning_model,
         temperature=0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("OPENAI_API_KEY"),
     )
     result = llm.invoke(formatted_prompt)
 
