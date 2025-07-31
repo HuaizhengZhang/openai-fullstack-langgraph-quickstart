@@ -29,18 +29,13 @@ class ReflectionState(TypedDict):
     number_of_ran_queries: int
 
 
-class Query(TypedDict):
-    query: str
-    rationale: str
-
-
 class QueryGenerationState(TypedDict):
-    search_query: list[Query]
+    search_query: list[str]
 
 
 class WebSearchState(TypedDict):
     search_query: str
-    id: str
+    id: int
 
 
 @dataclass(kw_only=True)
