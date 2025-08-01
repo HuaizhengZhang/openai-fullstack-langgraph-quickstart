@@ -1,0 +1,3 @@
+[submodule "backend/experimental/ReAct"]
+	path = backend/experimental/ReAct
+	url = git@github.com:ysymyth/ReAct.git
